@@ -4,6 +4,7 @@ from huggingface_hub import hf_hub_download
 
 # Download the GPT-2 tokens of Fineweb10B from huggingface. This
 # saves about an hour of startup time compared to regenerating them.
+# This is already-tokenized Fineweb10B, which is in ready-to-train binary format
 def get(fname):
     local_dir = os.path.join(os.path.dirname(__file__), 'fineweb10B')
     if not os.path.exists(os.path.join(local_dir, fname)):
