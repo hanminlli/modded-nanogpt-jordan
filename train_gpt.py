@@ -251,15 +251,42 @@ class Rotary(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+        ############################################################################################################
+        #   Explanation:
+        #       dim:                model embedding dimension
+        #       num_heads:          number of attention heads
+        #       max_seq_length:     maximum sequence length for rotary positional encoding
+        #       head_dim:           size of each attention head (defaults to 128).
+        ############################################################################################################
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        hdim = num_heads * head_dim
-        std = 0.5 * (dim ** -0.5)
+
+        hdim = num_heads * head_dim # Q, K, V should be of shape [Batch_size, Sequence Length, hdim=num_heads×head_dim]
+        std = 0.5 * (dim ** -0.5) # 0.5 is a tunable factor
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # If x ~ U(-a, a), uniform distribution, then Var(x) = a^2 / 3, Std(x) = a / sqrt(3)
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        ############################################################################################################
+        #   Explanation:
+        #       3：                 corresponds to Q, K, V
+        #       hdim:               total dimension of projection output
+        #                           decounpling head dim from dim
+        #       dim:                input embedding dimension
+        #       Result:             we are preparing 3 weight matrices W_q, W_k, W_v of [hdim, dim] and we are
+        #                           stacking them together
+        #       .uniform_:          fills with random values from a uniform distribution
+        #                           initializes the Q, K, V weights with a zero-centered, small, uniformly bounded 
+        #                           distribution, which helps stablize gradients, balance activation norms
+        #
+        #   Benefits:
+        #           1. reduce memory fragmentation
+        #           2. compute QKV in a single matrix multiplication for efficiency
+        ############################################################################################################
+
+
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
@@ -296,13 +323,14 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# Defining 1 transformer block
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
-        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.])) # trainable interpolation parameters
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
@@ -344,7 +372,6 @@ class GPT(nn.Module):
         # Registered: .to(device), .cuda(), .parameters(), .state_dict(), .load_state_dict()
         # If using a normal Python list, PyTorch would ignore these modules during training and saving.
 
-        #### BOOKMARK
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -397,11 +424,23 @@ class GPT(nn.Module):
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
+        # assuring that input_seq has shape (T, ), where T is the sequence length
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
+
+        ve = [value_embed(input_seq) for value_embed in self.value_embeds]  # Recall that this is a look up table
+        # the output would be [T, model_dim] for each element in the list
+
+
+        # 012 ... 012 structure for injecting token value embeddings into selected transformer blocks
+        # as part of a U-Net-like skip connection structure within the GPT model.
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
+        ############################################################################################################
+        #   Explanation:
+        #   [ve[0], ve[1], ve[2]]            # for first 3 blocks (blocks 0, 1, 2)
+        #   [None] * (12 - 6) = [None]*6     # skip 6 middle blocks (blocks 3–8)
+        #   [ve[0], ve[1], ve[2]]            # for last 3 blocks (blocks 9, 10, 11)
+        ############################################################################################################
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
@@ -557,9 +596,14 @@ if __name__ == "__main__":
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
+    # convert the parameters of embedding layers to bfloat16 (memory efficiency and faster compute on H100)
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
+    # copies the tensor from the process with rank 0 to all other processes in the distributed group
+    # need to use .detach(), to prevent it from interfering with autograd
 
+
+    # BOOKMARK. BOOKMARK.
     # collect the parameters to optimize
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
