@@ -159,15 +159,63 @@ class Muon(torch.optim.Optimizer):
         self.rank = rank
         self.world_size = world_size
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: list[Tensor] = [*params]
-        param_groups = []
-        for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            group = dict(params=[p for p in params if p.numel() == size],
-                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
-            param_groups.append(group)
-        super().__init__(param_groups, defaults)
 
+        params: list[Tensor] = [*params]
+        # creates a new list by unpacking whatever iterable was passed into the function. 
+        # the one being passed here is hidden_matrix_params
+        param_groups = []
+        for size in {p.numel() for p in params}: # numel() returns the product of a tensor'shape
+            # notice that this is a set, so every distinct element only appears once
+            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            ############################################################################################################
+            #   Explanation: Allocates a 2-D GPU tensor shaped [world_size, size]
+            #       world_size: one row per process/GPU in the distributed job.
+            #       size: exactly the number of elements in every parameter that will go into this group.
+            #
+            #   Process rank R writes its flattened, orthogonalised update into row b[R].
+            #   An dist.all_gather_into_tensor call fills all rows so every rank receives the full update matrix.
+            ############################################################################################################
+
+            group = dict(
+                params=[p for p in params if p.numel() == size],
+                update_buffer=b, 
+                update_buffer_views=[b[i] for i in range(world_size)]
+            )
+            ############################################################################################################
+            #   Explanation: Allocates a 2-D GPU tensor shaped [world_size, size]
+            #       params: 
+            #           All those tensors share a common element-count, so they can reuse the same communication buffer
+            #           without padding.
+            #       update_buffer:
+            #           Shared storage for cross-rank gathering of updates.
+            #       update_buffer_views:
+            #           creates a simple Python list of one-dimensional views
+            ############################################################################################################
+            
+            param_groups.append(group)
+            ############################################################################################################
+            #   Result:
+            #   [
+            #       {
+            #        'params': [Wqkv, Wmlp_fc, …],      # all tensors with 589 824 elements
+            #        'update_buffer': tensor([...]),    # [world_size, 589 824]
+            #         'update_buffer_views': [...]
+            #       },
+            #       {
+            #        'params': [Wmlp_proj, …],          # all tensors with 2 359 296 elements
+            #        'update_buffer': tensor([...]),    # [world_size, 2 359 296]
+            #        'update_buffer_views': [...]
+            #       },
+            #       ...
+            #   ]
+            ############################################################################################################
+
+            # The above buffers created to follow standard optimizer structure and NCCL communication.
+
+        super().__init__(param_groups, defaults)
+        # Calling super().__init__(…) lets Muon reuse all that machinery instead of re-implementing it.
+
+    # ************** BOOKMARK *****************
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -601,17 +649,40 @@ if __name__ == "__main__":
         dist.broadcast(param.detach(), 0)
     # copies the tensor from the process with rank 0 to all other processes in the distributed group
     # need to use .detach(), to prevent it from interfering with autograd
+    ############################################################################################################
+    #   An overview of the model structure:
+    #     GPT(...)                  # the model root
+    #     ├── Embedding(...)
+    #     ├── ModuleList([Embedding, Embedding, Embedding])
+    #     │   ├── Embedding(...)
+    #     │   ├── Embedding(...)
+    #     │   └── Embedding(...)
+    #     ├── ModuleList([... 12 × Block ...])
+    #     │   ├── Block(...)
+    #     │   │   ├── CausalSelfAttention(...)
+    #     │   │   │   ├── CastedLinear(qkv)
+    #     │   │   │   └── CastedLinear(proj)
+    #     │   │   └── MLP(...)
+    #     │   │       ├── CastedLinear(fc)
+    #     │   │       └── CastedLinear(proj)
+    #     │   └── … (other Blocks)
+    #     └── CastedLinear(lm_head)
+    ############################################################################################################
 
-
-    # BOOKMARK. BOOKMARK.
-    # collect the parameters to optimize
+    # dividing the params into several lists
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    # gradient orthogonalisation requires p.ndim >= 2, and we do not want to touch the embedding matrix
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    # token embedding, value embeddings
     scalar_params = [p for p in model.parameters() if p.ndim < 2]
     head_params = [model.lm_head.weight]
 
     # init the optimizer(s)
-    adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+    adam_params = [
+        dict(params=head_params, lr=0.22), # language model head with Adam
+        dict(params=embed_params, lr=0.6), # embedding use Adam
+        dict(params=scalar_params, lr=0.04) # layer norm weights, bias, skip scalars, use Adam
+    ]
     # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
     # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
     optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
