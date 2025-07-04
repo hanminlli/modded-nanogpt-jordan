@@ -115,6 +115,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
+    
+    #   Linear / attention projection	(out_features, in_features)	The common 2-D case.
+    #   Conv kernel flattened to a matrix before the call	(C_out, C_in × k_h × k_w) Muon flattens 4-D conv weight 
+    #   earlier so they still look 2-D here.
+
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
@@ -194,17 +199,17 @@ class Muon(torch.optim.Optimizer):
             
             param_groups.append(group)
             ############################################################################################################
-            #   Result:
+            #   Result: param_groups
             #   [
             #       {
-            #        'params': [Wqkv, Wmlp_fc, …],      # all tensors with 589 824 elements
-            #        'update_buffer': tensor([...]),    # [world_size, 589 824]
+            #         'params': [Wqkv, Wmlp_fc, …],      # all tensors with 589 824 elements
+            #         'update_buffer': tensor([...]),    # [world_size, 589 824]
             #         'update_buffer_views': [...]
             #       },
             #       {
-            #        'params': [Wmlp_proj, …],          # all tensors with 2 359 296 elements
-            #        'update_buffer': tensor([...]),    # [world_size, 2 359 296]
-            #        'update_buffer_views': [...]
+            #         'params': [Wmlp_proj, …],          # all tensors with 2 359 296 elements
+            #         'update_buffer': tensor([...]),    # [world_size, 2 359 296]
+            #         'update_buffer_views': [...]
             #       },
             #       ...
             #   ]
@@ -215,39 +220,75 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         # Calling super().__init__(…) lets Muon reuse all that machinery instead of re-implementing it.
 
-    # ************** BOOKMARK *****************
+
     @torch.no_grad()
     def step(self):
+        # Looping over groups of paramters of different shapes
         for group in self.param_groups:
             update_buffer: Tensor = group["update_buffer"]
             update_buffer_views: list[Tensor] = group["update_buffer_views"]
             # generate weight updates in distributed fashion
             params: list[Tensor] = group["params"]
+
             handle = None
+            # The asynchronous NCCL request returned by all_gather_into_tensor
+            # You later call handle.wait() to block only when you’re ready to use the gathered data.
             params_world = None
+
             def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                handle.wait()
+                handle.wait()  # Block until all gather finished
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world),
-                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
+                    p_world.add_(   # in place addition
+                        g_world.view_as(p_world),   # reshape flat row coming out of Newton Schultz
+                        alpha = - group["lr"] * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5
+                        # p_world.size(-2): d_out; p_world.size(-1) d_in, but no less than 1
+                    )
+                    
+            # Looping over parameters of a certain shape
             for base_i in range(len(params))[::self.world_size]:
+                # Slice that sequence with a step of self.world_size, for example, if worldsize is 4
+                # then we have 0, 4, 8, 12
+
                 if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+                    p = params[base_i + self.rank] # Each rank get a different parameter
                     g = p.grad
                     assert g is not None
-                    state = self.state[p]
+
+                    state = self.state[p] # state is inherited from Optimizer, stores per parameter state tensor
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf: Tensor = state["momentum_buffer"]
+                    # lazily allocates a momentum buffer the first time we see this parameter.
+                    # buf is that momentum tensor (same shape & dtype as g).
+
                     buf.lerp_(g, 1 - group["momentum"])
+                    # exponential moving average (EMA) update: buf ← (momentum)·buf + (1−momentum)·g.
+
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    # if Nesterov momentum is enabled, compute
+                    # at this point gradient is modified as SGDM update
+
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                    # gradient orthogonalization
                 else:
                     g = update_buffer_views[self.rank]
+                    # if this rank had no tensor in the (incomplete) bucket, we just reuse its row view as g
                 if base_i > 0:
                     update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                ################################################################################################
+                # Explanation: 
+                #   1. Copy g to update_buffer[rank]
+                #   2. Sends its row update_buffer[rank] to all peers
+                #   3. Receives row k from peer k into update_buffer[k]
+                #   4. Returns immediately with a Work handle object stored in handle
+                ##################################################################################################
+
                 params_world = params[base_i : base_i + self.world_size]
+                # Slices the parameter list to capture the exact set of tensors (“bucket”) whose updates are now in 
+                # transit. What bucket means: For world_size = 4 and base_i = 8, 
+                # the slice is params[8 : 12] → [ W8, W9, W10, W11 ]
             update_prev()
 
 # -----------------------------------------------------------------------------
@@ -687,6 +728,8 @@ if __name__ == "__main__":
     # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
     optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
     optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+
+    # *********************** BOOKMARK ***********************
     optimizers = [optimizer1, optimizer2]
     for opt in optimizers:
         for group in opt.param_groups:
