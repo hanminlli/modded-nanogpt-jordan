@@ -431,8 +431,12 @@ class Block(nn.Module):
 # -----------------------------------------------------------------------------
 # The main model
 
+# Equivalent to ceil[v / n] x n
+# * in signature ensures that n must be passed by names n=128
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+    # range(n, int(v) + 1 + n, n) gives n, 2n, 3n, ... up to at least v
+    # next() Retrieves the first value the generator yields
 
 
 ############################################################################################################
@@ -729,11 +733,11 @@ if __name__ == "__main__":
     optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
     optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 
-    # *********************** BOOKMARK ***********************
     optimizers = [optimizer1, optimizer2]
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+            # record initial lr rate
 
     # learning rate schedule: stable then decay
     def get_lr(step: int):
@@ -743,20 +747,32 @@ if __name__ == "__main__":
             return 1.0
         else:
             w = (1 - x) / args.cooldown_frac
-            return w * 1.0 + (1 - w) * 0.1
+            return w * 1.0 + (1 - w) * 0.1 # producing a linear decay
 
     # attention window size schedule: linearly increase
     @lru_cache(1)
     def get_window_size_blocks_helper(window_size: int):
         return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    ############################################################################################################
+    #   Explanation:
+    #       lru:
+    #           Wraps the function with a memo-table that keeps the return value for the most recent call. 
+    #           Subsequent calls with the same argument skip execution and return the cached object immediately.
+    #       maxsize=1: 
+    #           Only one entry is stored at a time, so memory never grows beyond a single tensor. When a new window_size
+    #           is requested, the old tensor is evicted and replaced.
+    ############################################################################################################
+    
     def get_window_size_blocks(step: int):
         x = step / args.num_iterations # progress in training
         assert 0 <= x <= 1
         # Linearly increase the block-wise sliding window size over training 128 -> 1792
         # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-        window_size = next_multiple_of_n(1728 * x, n=128)
-        return get_window_size_blocks_helper(window_size)
+        window_size = next_multiple_of_n(1728 * x, n=128) # ceil[1728 * x / 128] x 128
+        # as x increases: window_size gradually becomes 128, 258 ..., 1792
+        return get_window_size_blocks_helper(window_size) # Convert token count to block count
 
+    # ****************************** Bookmark *********************** Flash attention and Flex attention
     model: nn.Module = torch.compile(model, dynamic=False)
 
     ########################################
