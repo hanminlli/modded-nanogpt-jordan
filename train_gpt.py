@@ -416,7 +416,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng ---> Mimicing a UNet structure
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.])) # trainable interpolation parameters
@@ -476,8 +476,8 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
+        BLOCK_SIZE = 128 # the whole 48k tokens sequence is reshaped into blocks of 128 tokens
+        docs = (input_seq == 50256).cumsum(0) # document boundaries returns true, cumsum gives mannual indices
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -490,19 +490,61 @@ class GPT(nn.Module):
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         # manual block mask creation by @YouJiacheng
-        assert len(input_seq) % BLOCK_SIZE == 0
-        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        causal_blockmask_any = block_idx[:, None] >= block_idx
+        assert len(input_seq) % BLOCK_SIZE == 0 # ensure that we do it without padding
+        NUM_BLOCKS = len(input_seq) // BLOCK_SIZE # number of blocks
+        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda") # block index list shape (B,)
+        # block_idx[:, None] turns it into (B, 1), we compare (B, 1) and (1, B) broadcasted resuly is (B, B)
+        # By default row is query block and column is key block
+        causal_blockmask_any = block_idx[:, None] >= block_idx # Lower triangular
+        #         q≥k   k=0  1  2  3        Meaning
+        #         ───────────────────────────────
+        #         q=0   T  F  F  F   ← block 0 may look at 0 (its own past)
+        #         q=1   T  T  F  F   ← block 1 may look at blocks 0 & 1
+        #         q=2   T  T  T  F
+        #         q=3   T  T  T  T
         causal_blockmask_all = block_idx[:, None] > block_idx
+        #         q>k   k=0  1  2  3        Meaning
+        #         ───────────────────────────────
+        #         q=0   F  F  F  F   ← block 0 has no strictly earlier block
+        #         q=1   T  F  F  F   ← every token of block 0 is < every token of block 1
+        #         q=2   T  T  F  F
+        #         q=3   T  T  T  F
         docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        # .view(-1, BLOCK_SIZE) reshape it into [B, 128], without copying (it just adjusts strides)
+        # [:, 0] takes the index of the first token in each block, as a result it is shape (B,)
         docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
+        ############################################################################################################
+        #   Explanation:
+        #       contiguous():
+        #           If the tensor is already stored in one tight, row-major block of memory (tensor.is_contiguous() == 
+        #           True), contiguous() is a no-op: it returns the same storage, no data move.
+        #
+        #           Transpose, slice, or flip operations create views whose elements live at “skipped” 
+        #           addresses (non-unit strides). Calling .contiguous() allocates fresh memory and copies 
+        #           the data into that new, gap-free layout, so later kernels can treat the tensor as a regular 
+        #           dense array.
+        ############################################################################################################
+
         document_blockmask_any = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
+        # docs_low[:, None] becomes [B, 1]
+        # The earliest document seen in block q is no later than the latest document in block k
+        # The latest document in block q is no earlier than the earliest document in block k
+        # Overall the result is there exists at least one token pair (q-token, k-token) 
+        # that belongs to the same document. Result: shape (B, B)
         document_blockmask_all = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+        # every token of both blocks lies in the same single document Result: shape (B, B)
+
+        # Combine causal and document rules
         blockmask_any = causal_blockmask_any & document_blockmask_any
+        # shape (B, B): blockmask_any[i,k]==1 means “some subset of block k is visible to queries in block i.”*
         blockmask_all = causal_blockmask_all & document_blockmask_all
+        # shape (B, B): blockmask_all[i,k]==1 means “all 128 tokens of block k are visible to block i.”
+
+        # **************************** BOOKMARK ******************************
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
+
+
         def build_bm(window_size_blocks: Tensor) -> BlockMask:
             return BlockMask.from_kv_blocks(
                 torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
@@ -518,6 +560,8 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
         # assuring that input_seq has shape (T, ), where T is the sequence length
+        # notice we are using a micro batch of size 1 on 1 gpu
+        # the overall "batch" size equals the number of GPU
 
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]  # Recall that this is a look up table
@@ -774,6 +818,9 @@ if __name__ == "__main__":
 
     # ****************************** Bookmark *********************** Flash attention and Flex attention
     model: nn.Module = torch.compile(model, dynamic=False)
+    # The result is a wrapped module that behaves identically to the original but runs its forward 
+    # and backward passes through those fused kernels.
+    # dynamic=False: Assume input tensor shapes do not change across iterations; compile a single static graph
 
     ########################################
     #            Warmup kernels            #
@@ -783,17 +830,25 @@ if __name__ == "__main__":
     warmup_steps = 10
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                         optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+    
+    # make the just-compiled model and the two optimizers generate (and cache) their
+    # CUDA kernels before real training starts
     for _ in range(warmup_steps):
         inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device="cuda")
+        # [0, args.vocab_size), 
         model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
+    
+
+    # Reload the snapshots 
     model.load_state_dict(initial_state["model"])
     for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
         opt.load_state_dict(opt_state)
     del initial_state
 
+    # ************************ BOOKMARK ************************
     ########################################
     #      Overlap Communication Setup     #
     ########################################
