@@ -623,6 +623,14 @@ class GPT(nn.Module):
         # Long mask: span = W blocks
         # Short mask: span = W / 2 blocks
         # Pattern L-S-S-S-L-S-S-L-S-S-S-L
+        #
+        # About the mask
+        # Rows kept:            all queries (nothing is pruned on that axis).
+        # Columns kept:         only K/V tokens that are
+        #                       > within the sliding window of size W blocks,
+        #                       > not in the future
+        #                       > in the same document
+        # Everything else is treated as -∞, i.e. receives zero probability after the soft-max.
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
