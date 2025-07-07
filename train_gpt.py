@@ -476,18 +476,42 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128 # the whole 48k tokens sequence is reshaped into blocks of 128 tokens
+        BLOCK_SIZE = 128 # the whole 48k tokens sequence is reshaped into blocks of 128 tokens, B = 384
         docs = (input_seq == 50256).cumsum(0) # document boundaries returns true, cumsum gives mannual indices
 
         def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
+            # q_idx, kv_idx are absolute token indices, plus batch, head slots (unused)
+            causal_mask = q_idx >= kv_idx # Only look at casual blocks (not in future)
+            document_mask = docs[q_idx] == docs[kv_idx] # both tokens belong to the same document (docs[...] equal).
             return causal_mask & document_mask
 
         def dense_to_ordered(dense_blockmask: Tensor):
-            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
+            # Input: B x B matrix, boolean
+            num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32) # cheaper than int64
+            # sum(dim=-1) reduces along the last axis (columns), 
+            # num_blocks[q] tells how many KV blocks row q must later look at.
             indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            # Stage 1: argsort(dim=-1, descending=False, stable=True) returns indices that would sort each row 
+            # ascending (stable) along the last dimension, Shape (B, B), default dtype int64
+            # For each row q you now have a permutation of 0…B-1. All the True columns are clustered at the right end
+            # Stage 2: flip(-1): Reverses the elements within each row (last dimension). 
+            # After reversing, the indices of True columns move to the left side of the row, in descending column
+            # order. This is handy because subsequent kernels will read just the first num_blocks[q] entries of
+            # each row — those now correspond exactly to the allowed KV blocks for that query row.
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+            # nums_blocks[None, None] adds two singleton dimensions at the front (unsqueeze twice), shape (1, 1, B)
+            # indices: shape (1, 1, B, B)
+            ############################################################################################################
+            #   Explanation:
+            #       num_blocks[q] tells the Flex-Attention kernel how many KV tiles (columns) should be fetched 
+            #       for query block q. 
+            
+            #       indices[q, 0 : num_blocks[q]] tells which tiles (their column indices), already ordered so 
+            #       the kernel can stream them without another sort.
+
+            #       The extra leading (1,1, …) dims allow a single mask tensor to be broadcast 
+            #       across batch and head dimensions without copying.
+            ############################################################################################################
 
         # manual block mask creation by @YouJiacheng
         assert len(input_seq) % BLOCK_SIZE == 0 # ensure that we do it without padding
@@ -540,22 +564,65 @@ class GPT(nn.Module):
         blockmask_all = causal_blockmask_all & document_blockmask_all
         # shape (B, B): blockmask_all[i,k]==1 means “all 128 tokens of block k are visible to block i.”
 
-        # **************************** BOOKMARK ******************************
+        # The previous BxB = 147654 (150 k)
+        # ~: to invert True and False, basically, we want to exclude the those blocks whose tokens are all visable
+        # in a word, there is some legal attention (any), but not the whole tile (all is False)
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
 
-
+        # full_kv_num_blocks[q] – how many completely legal KV blocks (whole 128 × 128 tile safe)
+        # full_kv_indices[q, ·] – their column indices
+        # partial_kv_num_blocks[q] – how many partially legal KV blocks (need a causal/doc prefix mask)
+        # partial_kv_indices[q, ·] – their column indices
         def build_bm(window_size_blocks: Tensor) -> BlockMask:
             return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
-                full_kv_indices,
+                torch.clamp_max(
+                    partial_kv_num_blocks,
+                    torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)
+                ), # (1, 1, B) allowed count
+                partial_kv_indices, # (1, 1, B, B) allowed indices
+                torch.clamp_max(
+                    full_kv_num_blocks, 
+                    window_size_blocks - 1
+                ), # (1, 1, B) allowed count, reserved 1 for itself
+                full_kv_indices, # (1, 1, B, B) allowed indices
                 BLOCK_SIZE=BLOCK_SIZE,
                 mask_mod=document_causal,
+                # When you pass a mask_mod callable:
+                #   1. Full tiles (those in full_kv_*) are unaffected; the kernel uses the whole 128 × 128 KV tile.
+                #   2. Partial tiles (those in partial_kv_*) need a prefix mask, 
+                #      because only some tokens of the tile are legal.
+                #           For each query token in the block, the kernel evaluates
+                #           keep = mask_mod(b, h, q_abs_idx, kv_abs_idx) to decide 
+                #           whether to include the (q, k) pair in the soft-max accumulation.
+                #
+                #       Using a callable instead of a pre-computed dense mask keeps the BlockMask tiny
+                #        (O(B·W) metadata) while still giving the CUDA code an exact per-token rule.
             )
+        ############################################################################################################
+        #   Explanation:
+        #       1st torch.clamp_max: 
+        #           partial_kv_num_blocks: (1, 1, B)
+        #               How many partially visible KV-blocks each 
+        #               query-block could use if there were no window limit.
+        #           full_kv_num_blocks: (1, 1, B)
+        #               How many fully visible KV-blocks are already available to each query-block.
+        #           window_size_blocks: scalar (e.g. 1792 tokens ÷ 128)
+        #           
+        #           window_size_blocks - full_kv_num_blocks: (1, 1, B)
+        #               equivalent to remaining[q] = window_size_blocks - full_kv_num_blocks[q]
+        #               remaining budget for “partial” tiles, can go below 0 if the  already filled by full tiles
+        #           torch.clamp_min(…, 1): (1, 1, B)
+        #               returns max(1, x), forces remaining[q] to be 1 since we need to keep query's own block
+        #           torch.clamp_max(partial_kv_num_blocks, remaining): (1, 1, B)
+        #               returns min(x, y) elementwisely.
+        ############################################################################################################
+
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+        # Long mask: span = W blocks
+        # Short mask: span = W / 2 blocks
+        # Pattern L-S-S-S-L-S-S-L-S-S-S-L
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
@@ -579,6 +646,7 @@ class GPT(nn.Module):
         #   [ve[0], ve[1], ve[2]]            # for last 3 blocks (blocks 9, 10, 11)
         ############################################################################################################
 
+        # ******************** BOOKMARK *********************
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
