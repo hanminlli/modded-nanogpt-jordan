@@ -23,25 +23,38 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
+# mutate_args=() tells pytorch telling PyTorch’s dispatcher and autograd system 
+# that this custom operator does not modify any of the tensors you pass in.
+@torch.library.custom_op("nanogpt::mm", mutates_args=()) # Registers a new PyTorch operator named "nanogpt::mm".
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
+    @torch.compile # Wraps so that PyTorch will trace and optimize it into a fused kernel.
     def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
+        assert x.is_contiguous() and w.is_contiguous() 
+        # ensures both inputs have contiguous memory layouts, which the low-level kernel requires.
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        # Divide each element by its scale (x_s or w_s).
+        # Cast into the 8-bit floating format float8_e4m3fn (4-bit exponent, 3-bit mantissa).
+        # This is essentially quantization, we have x ≈ q × s, where x is full precision, q is small
+        # low precision quantized number, there is a scaling factor s, we can later require x by multiplying back.
+        # there are multiple components, so x_s, w_s are best fits
         out = torch._scaled_mm(
             x_f8,
             w_f8.T,
             out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            scale_a=x.new_tensor(x_s, dtype=torch.float32), # Creates a brand‐new tensor of scalar x_s.
+            scale_b=x.new_tensor(w_s, dtype=torch.float32), # Creates a brand‐new tensor of scalar w_s.
             use_fast_accum=True,
         )
+        # Multiplies x_f8 by the transpose of w_f8, specifies out_dtype=torch.bfloat16 to cast the result into bfloat16.
+        # scale_a and scale_b restore the original magnitudes by re-multiplying by x_s and w_s.
         return out, x_f8, w_f8
 
     return impl(x, w)
+    # return the matrix product after quantization, and two quantized multiplier in order
 
+# pure-Python version of your operator that PyTorch can call 
+# whenever your high-performance, compiled FP8 kernel isn’t available or can’t be used. 
 @mm_op.register_fake
 def _(x: Tensor, w: Tensor, *_):
     assert x.ndim == w.ndim == 2
@@ -50,33 +63,50 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.is_contiguous() and w.is_contiguous()
     return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
 
+# This is necessay, otherwise Autograd won’t know how to back-propagate through your custom op
+# Gives: RuntimeError: derivative for ‘nanogpt::mm’ not implemented
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    # g is the incoming gradient ∂L/∂out shape [N, M]
+    # returns a tuple (∂L/∂x, ∂L/∂w)
     @torch.compile
     def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
         assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+        # Ensures grad resides in a single, row-major block of memory.
+        # The low-level _scaled_mm kernel requires contiguity for correctness and performance.
+        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32) # same memory format and striding as grad
         w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
         grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2) # (5-bit exponent, 2-bit mantissa)
+
+        ############################################################################################################
+        # Explanation:
+        #       The formula: out = x @ W.T
+        #           indicates: ∂L/∂x = ∂L/∂out x W
+        #           indicates: ∂L/∂W = (∂L/∂out).T x x
+        ############################################################################################################
         grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
+            grad_f8,    # [N×M] in FP8, N=batchsize x seq_len, M is the number of output features,
+            w_f8.T.contiguous().T,  # [M×D] in FP8, twice-transposed for contiguity, D is the number of input features
             out_dtype=torch.bfloat16,
             scale_a=grad_inv_s,
             scale_b=w_inv_s,
             use_fast_accum=False,
-        )
+        )   # result becomes shape [N, D]
+        # Under the hood this computes roughly
+        # (∂L/∂out ÷ grad_s) x (W ÷ w_s)^T
         # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
         grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
+            x_f8.T.contiguous(), # (D × N)
+            grad_f8.T.contiguous().T, # (N × M)
             out_dtype=torch.float32,
             scale_a=x_inv_s,
             scale_b=grad_inv_s,
             use_fast_accum=False,
-        ).T
+        ).T # Flip to M, D, matching the orientation of original W
         return grad_x, grad_w
+        # hint, just check the shape.
 
     return impl(g, x_f8, w_f8)
 
@@ -85,21 +115,41 @@ def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
     return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
 
 def backward(ctx, grad_out: Tensor, *_):
+    # it is executed by PyTorch, during the backward pass, 
+    # once it reaches the nanogpt::mm node in the autograd graph.
     x_f8, w_f8 = ctx.saved_tensors
     x_s, w_s, grad_s = ctx.scales
     grad_x, grad_w = torch.ops.nanogpt.mm_backward(
         grad_out, x_f8, w_f8, x_s, w_s, grad_s
     )
-    return grad_x, grad_w, None, None, None
+    return grad_x, grad_w, None, None, None # three scale-factor inputs get None.
+    # we set materialization=False, so that 
+    # PyTorch won’t waste GPU or CPU memory creating unused zeros for those None slots
 
 def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    ############################################################################################################
+    # Explanation:
+    #       ctx: 
+    #           a fresh FunctionCtx object that you can use to stash anything you’ll need in the backward pass.
+    #       inputs:
+    #           the exact Python‐level arguments you originally passed to torch.ops.nanogpt.mm(…)
+    #       outputs:
+    #           the tuple your forward returned—i.e. (out, x_f8, w_f8)
+    ############################################################################################################
+
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
     ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
+    ctx.set_materialize_grads(False) # Not to pre allocate
+    # “I promise my backward implementation will only return real gradient tensors for the inputs that 
+    # actually need them, and will return None for the rest. You don’t need to pre-allocate 
+    # zero-filled tensors for those.""
 
 mm_op.register_autograd(backward, setup_context=setup_context)
+# Register so that PyTorch knows that, after running the forward, 
+# it should call your setup_context(ctx, inputs, output) to save whatever is needed for backward.
+# Later, when it sees this op in the graph during backprop, it should call your backward
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -296,14 +346,18 @@ class Muon(torch.optim.Optimizer):
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
+    # root mean square norm, element wise operation, normalize along the last dimension (d = model dimension)
 
 class CastedLinear(nn.Linear):
+    # it inherits the nn.Linear class
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
-        super().__init__(in_features, out_features, bias=False)
+        super().__init__(in_features, out_features, bias=False) # no bias vector
         self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
+        # x_s, w_s, grad_s: Control how the inputs, weights, and gradients 
+        # are quantized into FP8 and then de‐scaled back.
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -313,30 +367,52 @@ class CastedLinear(nn.Linear):
 
     def forward(self, x: Tensor):
         if self.use_fp8 and self.training:
-            _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-            return out.reshape(*x.shape[:-1], -1)
+            # only if in the training we want to use FP8
+            _x = x.flatten(0, -2) # starting from 0 and end in the second last (inclusiv)
+            out: Tensor = torch.ops.nanogpt.mm( _x, # 2-D input matrix of shape (N, in_features)
+                                                self.weight, # 2-D weight matrix of shape (out_features, in_features)
+                                                x_s=self.x_s,
+                                                w_s=self.w_s,
+                                                grad_s=self.grad_s
+                                                )[0]
+            return out.reshape(*x.shape[:-1], -1) # reshape it
         else:
             return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
+    # inject time-step awareness into Q & K
+    # RoPE (Rotary Positional Embedding):
+    # In RoPE, we treate 1D vectors of length head_dim=d as d/2 complex numbers (real, img, real img)
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        # the goal here is to build 2 GPU look up tables
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
+        # 1D tensor of frequenceies, dim // 4, (half of the pairs rotated and the other half unrotated) 
+        # [1.0, ..., (1/1024)^{1/(N-1)}, ..., 1/1024].
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim // 4)]) # pad with zero
+        # angular_freq.new_zero creates a fresh tensor of zeros that inherits 
+        # all the “meta” properties of the tensor it is called on, such as dtype and device
+        t = torch.arange(max_seq_len, dtype=torch.float32) # token index
         theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        # compute outer product,
+        # theta_{t, k} = t [t] x ω [k], size [L, dim //2]
+        self.cos = nn.Buffer(theta.cos(), persistent=False) # Store cos θ in a non-parameter buffer. 
+        # persistent=False → the tensor won’t be written to the state-dict
         self.sin = nn.Buffer(theta.sin(), persistent=False)
 
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
         x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        # x1 gets all even-index channels, and x2 gets all old-index channels\
+        # x1: [B, T, H, d//2], x2: [B, T, H, d//2]
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+        # Rotation:
+        # [cosθ, sinθ   [ RE
+        #  -sinθ, cosθ]   IMG ]
+        return torch.cat((y1, y2), 3).type_as(x_BTHD) # concatenate wrt the 3rd axis.
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
@@ -380,13 +456,42 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        # immediately overwrites every entry with 0, without adding any ops to the autograd tape
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
+        # “value-embedding” tensor *or* None
         B, T = x.size(0), x.size(1) # batch size, sequence length
+        # it is using T as the sequence length, in our notation we use L.
         assert B == 1, "Must use batch size = 1 for FlexAttention"
+        # notice that each gpu have a sequence, and the design is optimized for B=1
+
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        # Generate Q, K, V in a single fused matrix-multiplication and
+        # reshape them into the usual (B, T, H, d) layout for multi-head attention
+        # x: (1, T, E);  self.qkv_w : (3, H·d, E); 
+        ############################################################################################################
+        #   Explanation:
+        #       self.qkv_w.flatten(end_dim=1): merge the first two dims, resulting in (3*H*d, E)
+
+        #       .type_as(x): cast to x's type: bf16 when training, fp32 in eval
+
+        #       F.linear: fused projection, merges the original 3 generalized matrix-matrix multiplication
+        #       into 1. In our case, x: (1, T, E), W: (3Hd, E) and no bias, so we do x W^T
+        #       This allows us to get a result of (1, T, 3Hd), and for every token in the sequence, we get 
+        #       [ Q_tokens , K_tokens , V_tokens ].
+        
+        #       .view(B, T, 3*H, d): immediately reshape it into # (B, T, 3H, d)
+        #       .chunk(3, dim=-2): chunk the second last dimesion  # → q, k, v each (B, T, H, d)
+        ############################################################################################################
+
         q, k = norm(q), norm(k) # QK norm @Grad62304977
+        # the attention score is computed using normalized q, k with fixed magnitude, 
+        #  the authors can use a single learnt or fixed scale (scale=0.12 later in the Flex-Attention call) instead of the canonical 1 / √d
+
+        
+        # (B, T, H, d); (B, T, H, d)
         q, k = self.rotary(q), self.rotary(k)
+        # **************************** START ****************************
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
@@ -398,6 +503,7 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+# ******************** BOOKMARK *********************
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -412,7 +518,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-# Defining 1 transformer block
+# ******************** BOOKMARK *********************
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
@@ -473,7 +579,8 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        self.skip_weights = nn.Parameter(torch.ones(num_layers//2))
+        self.skip_weights = nn.Parameter(torch.ones(num_layers // 2))
+        # This makes the skip weights trainable
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128 # the whole 48k tokens sequence is reshaped into blocks of 128 tokens, B = 384
@@ -649,33 +756,62 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
         ############################################################################################################
         #   Explanation:
-        #   [ve[0], ve[1], ve[2]]            # for first 3 blocks (blocks 0, 1, 2)
-        #   [None] * (12 - 6) = [None]*6     # skip 6 middle blocks (blocks 3–8)
-        #   [ve[0], ve[1], ve[2]]            # for last 3 blocks (blocks 9, 10, 11)
+        #       [ve[0], ve[1], ve[2]]            # for first 3 blocks (blocks 0, 1, 2)
+        #       [None] * (12 - 6) = [None]*6     # skip 6 middle blocks (blocks 3–8)
+        #       [ve[0], ve[1], ve[2]]            # for last 3 blocks (blocks 9, 10, 11)
         ############################################################################################################
 
-        # ******************** BOOKMARK *********************
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+        # long_bm, short_bm: Blockmask object
+        ############################################################################################################
+        #   Explanation:
+        #       Blockmask object: four integer tensors plus two scalars: very small, GPU-resident struct.
+        #       # 1. “partial” KV tiles (need inside-tile prefix mask)
+        #           partial_kv_num_blocks : int32[1,1,B]   # how many partial blocks per query-block
+        #           partial_kv_indices    : int32[1,1,B, ≤W]# their column indices (padded)
+
+        #       # 2. “full” KV tiles (whole 128×128 tile is legal)
+        #           full_kv_num_blocks    : int32[1,1,B]   # how many full blocks per query-block
+        #           full_kv_indices       : int32[1,1,B, ≤W]# their column indices (padded)
+
+        #       BLOCK_SIZE = 128                       # tokens per block (compile-time const)
+        #       mask_mod   = <function document_causal># callback for inside-tile masking
+        ############################################################################################################
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        # L-S-S-S-L-S-S-L-S-S-S-L, short block masks indicate fewer K/V tiles per query, and lower FLOPS, memory.
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        # self.embed turns input seq from (L,) to (L, d)
+        # [None] is equivalent to .unsqueeze(0), creating the batch dim with batchsize=1: (1, L, d)
+        # norm(): normalize using RMS norm
 
         # U-net design by @brendanh0gan
         skip_connections = []
-        n = len(self.skip_weights)
+        n = len(self.skip_weights) # how many such skips you are going to need
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
+                # 6 linked with output of 5, 7 linked with output of 4, ..., pop remove and returns the last tensor
+
             x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            # x0 is the original token embedding,  provides a global, per-token skip available
+            # in every layer, reminiscent of UNet’s “constant resolution” pathway.
             if i < n:
                 skip_connections.append(x)
 
-        x = norm(x)
-        logits = self.lm_head(x).float()
+        x = norm(x) # (1, L, E) (E is the model dimension, hdim * num_heads)
+        # running hidden state can still accumulate magnitude drift through the residual paths
+        # A final normalisation rescales every token vector to unit‐RMS, 
+        # giving the next layer a consistent input distribution.
+        logits = self.lm_head(x).float() # (1, L, V) in bfloat 16, V stands for vocabulary size.
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+        # x.size(-1) gives model dimension E, and then we take the square root
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
+        # logits original shape (1, L, V), we flatten the 1,T dim ==> each row is vocabulary logit for 1 token
+        # target_seq: vocabulary token ID, should be (L, )
+        # reduction=sum adds the loss, so the gradient ~ L
         return loss
 
 # -----------------------------------------------------------------------------
@@ -892,7 +1028,7 @@ if __name__ == "__main__":
         # as x increases: window_size gradually becomes 128, 258 ..., 1792
         return get_window_size_blocks_helper(window_size) # Convert token count to block count
 
-    # ****************************** Bookmark *********************** Flash attention and Flex attention
+    # Flash attention and Flex attention
     model: nn.Module = torch.compile(model, dynamic=False)
     # The result is a wrapped module that behaves identically to the original but runs its forward 
     # and backward passes through those fused kernels.
