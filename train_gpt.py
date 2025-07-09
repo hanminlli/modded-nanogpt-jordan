@@ -491,7 +491,6 @@ class CausalSelfAttention(nn.Module):
         
         # (B, T, H, d); (B, T, H, d)
         q, k = self.rotary(q), self.rotary(k)
-        # **************************** START ****************************
         if ve is not None:
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
@@ -499,11 +498,11 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side 
+        # (B, T, E)
         y = self.c_proj(y)
         return y
 
-# ******************** BOOKMARK *********************
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -518,7 +517,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-# ******************** BOOKMARK *********************
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
@@ -818,31 +816,65 @@ class GPT(nn.Module):
 # Our own simple Distributed Data Loader
 
 def _load_data_shard(file: Path):
+    # shard refers to something like fineweb_train_000001.bin
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    # Read the 256-int32 “header” at the very start of the file
+    # torch.from_file maps the first 256 32-bit integers straight off disk into a tensor called `header`.  
+    # `header[0]` is a “magic number” to verify you’re looking at the right file format; `header[1]` is a version.  
+
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+
+    # "rb", no buffering mode
     with file.open("rb", buffering=0) as f:
+        # Allocate a pinned-memory uint16 tensor to hold all tokens
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        # pin_memory=True means this buffer can be DMA-transferred to the GPU without an extra copy
         f.seek(256 * 4)
+        # Skip past the 256×4-byte header, 
+
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        # reads raw bytes straight into the NumPy array backing your tensor
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+        # uint16
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    # List all matching files on disk, sorted to keep a stable order.
+    # Wrap each path in a Path(...) for easy file operations.
     assert batch_size % world_size == 0
-    local_batch_size = batch_size // world_size
+    local_batch_size = batch_size // world_size 
+    # simply how many tokens each individual 
+    # GPU (or process) handles on every step.
+    # Each GPU's share
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    # Turn your file list into an iterator, so you can cycle through shards.
+
     tokens, pos = _load_data_shard(next(file_iter)), 0
+    # 1-D torch.Tensor of shape [num_tokens] containing your token ID
     while True:
         if pos + batch_size + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
+            tokens, pos = _load_data_shard(next(file_iter)), 0 # directly drop the rest
+            # we need batch_size + 1 tokens each time (so we can form inputs of 
+            # length batch_size and targets shifted by one).
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        # GPU 0 reads from pos + 0 * L, GPU 1 from pos + 1 * L, then after slicing, we
+        # then take the first local_batch_size + 1
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
         pos += batch_size
+        # we do not train on sliding window, since it would be redundant
+
         yield inputs, targets
+        # turns the surrounding function into a generator
+        # returns (inputs, targets) back to whatever code 
+        # called next(train_loader) (or iterated over train_loader).
+        # After yielding, the function’s internal state (all local variables, the current pos, etc.) is frozen.
+        # Control returns to the caller.
+        # The next time you call next(train_loader), execution resumes 
+        # immediately after the yield, picking up the while True: loop for the next batch.
 
 # -----------------------------------------------------------------------------
 # int main
@@ -1060,10 +1092,19 @@ if __name__ == "__main__":
         opt.load_state_dict(opt_state)
     del initial_state
 
-    # ************************ BOOKMARK ************************
     ########################################
     #      Overlap Communication Setup     #
     ########################################
+
+    ############################################################################################################
+    #   Explanation:
+    #       We “bucket” parameters here so that when it comes time 
+    #       to all-reduce (i.e. average) gradients across GPUs:
+    #           1. Overlap communication with computation. By grouping many small tensors into
+    #            a few medium‐sized buckets (∼25 MB each), we issue fewer large NCCL calls instead 
+    #            of hundreds of tiny ones. That cuts latency and lets us start the 
+    #            all-reduce for one bucket while still computing gradients for the next.
+    ############################################################################################################
 
     # Create parameter buckets for better overlap
     def create_buckets(params, bucket_size_mb=25):
@@ -1072,38 +1113,50 @@ if __name__ == "__main__":
         current_bucket = []
         current_size = 0
 
-        # Sort parameters by size (largest first) for better bucketing
+        # Sort parameters by size (largest first) for better bucketing, descending order
         sorted_params = sorted(params, key=lambda p: p.numel(), reverse=True)
 
         for param in sorted_params:
             param_size_mb = param.numel() * param.element_size() / (1024 * 1024)
+            # size in MB, the original product is size in byte
 
             if current_size + param_size_mb > bucket_size_mb and current_bucket:
+                # over 25 MB, close out and start a new bucket
                 buckets.append(current_bucket)
                 current_bucket = [param]
                 current_size = param_size_mb
             else:
+                # else just append
                 current_bucket.append(param)
                 current_size += param_size_mb
 
         if current_bucket:
+            # if there are any partially filled bucket
             buckets.append(current_bucket)
 
         return buckets
 
     # Create buckets for all parameters
-    all_params = [p for p in model.parameters() if p.requires_grad]
+    all_params = [p for p in model.parameters() if p.requires_grad] 
+    # every parameter tensor in the model that participates in training
     param_buckets = create_buckets(all_params)
+    # Once we have param_buckets, later we register a gradient‐ready hook on each parameter; 
+    # when all gradients in a bucket are ready, we fire a single all-reduce on that bucket, 
+    # rather than one per parameter.
 
     print0(f"Created {len(param_buckets)} gradient buckets")
     for i, bucket in enumerate(param_buckets):
         total_size = sum(p.numel() * p.element_size() for p in bucket) / (1024 * 1024)
         print0(f"Bucket {i}: {len(bucket)} params, {total_size:.1f} MB")
+    # Recording bucket size
 
     # Bucket state tracking
     bucket_ready_count = [0] * len(param_buckets)
+    # When bucket_ready_count[b] reaches the number of parameters in bucket b, all gradients are ready
     bucket_handles = [None] * len(param_buckets)
+    # used to store the returned handle of all_reduce
     param_to_bucket = {}
+    # maps each parameter tensor object to the index of the bucket
 
     # Map each parameter to its bucket index
     for bucket_idx, bucket in enumerate(param_buckets):
@@ -1112,6 +1165,10 @@ if __name__ == "__main__":
 
     def _gradient_hook(param: Tensor):
         """Called when a parameter's gradient is ready"""
+        # “post‐accumulate” hook on every trainable parameter
+        # so it runs each time PyTorch finishes computing a .grad for one parameter.
+        # track when all gradients in a given bucket are ready, and 
+        # then kick off a single asynchronous all-reduce on that entire bucket
         if param.grad is None:
             return
 
@@ -1121,7 +1178,7 @@ if __name__ == "__main__":
         # Check if all parameters in this bucket are ready
         if bucket_ready_count[bucket_idx] == len(param_buckets[bucket_idx]):
             # All-reduce this bucket
-            bucket_grads = [p.grad for p in param_buckets[bucket_idx]]
+            bucket_grads = [p.grad for p in param_buckets[bucket_idx]] # list of gradients
 
             # For multi-tensor operations, we can reduce them together
             if len(bucket_grads) == 1:
@@ -1129,6 +1186,9 @@ if __name__ == "__main__":
             else:
                 # Use multi-tensor all-reduce for efficiency
                 handle = dist.all_reduce_coalesced(bucket_grads, op=dist.ReduceOp.AVG, async_op=True)
+                # packs them into a single NCCL call for efficiency
+            # In both cases, async_op=True means the call is non-blocking; 
+            # it returns immediately with a “work handle.”
 
             bucket_handles[bucket_idx] = handle
 
@@ -1136,12 +1196,15 @@ if __name__ == "__main__":
     print0("Registering bucketed gradient hooks...")
     for param in all_params:
         param.register_post_accumulate_grad_hook(_gradient_hook)
+    # Under the hood, as soon as PyTorch finishes accumulating that parameter’s gradient tensor 
+    # (i.e. sets or adds into param.grad), it invokes _gradient_hook(param).
 
     def wait_for_gradients():
         """Wait for all gradient reductions to complete and reset bucket state"""
         for handle in bucket_handles:
             if handle is not None:
                 handle.wait()
+        # Ensure all asynchronous gradient reductions have finished
 
         # Reset state for next iteration
         for i in range(len(bucket_ready_count)):
@@ -1153,11 +1216,25 @@ if __name__ == "__main__":
     #        Training and validation       #
     ########################################
 
-    train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+    train_loader = distributed_data_generator(
+        args.train_files, 
+        world_size * args.train_seq_len, 
+        rank,
+        world_size
+    )
+    # setting up your infinite training-data iterator, sharded across GPUs
+    # args.train_files is the glob pattern for your on-disk shard files.
+    # batch_size = world_size * args.train_seq_len is the global batch size in tokens.
+    # rank and world_size tell each process which slice of that global batch it should actually load.
+    # Every time you call next(train_loader), you get a pair (inputs, targets) of length 
+    # local_batch_size = batch_size // world_size = args.train_seq_len; 
+    # each process sees a non-overlapping window of the data, so together they cover the full global batch.
+
     training_time_ms = 0
     # start the clock
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    # ensures that any preceding GPU work (e.g. your warmup kernel launches) has completed before we start timing.
+    t0 = time.perf_counter() # records the current (wall-clock) time in seconds with high precision.
     # begin training
     train_steps = args.num_iterations
     for step in range(train_steps + 1):
@@ -1165,13 +1242,17 @@ if __name__ == "__main__":
 
         # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
+            # measure validation loss periodically and also include the training time up to that point.
+            
+            torch.cuda.synchronize() # stop the clock
+            training_time_ms += 1000 * (time.perf_counter() - t0) # add the elapsed time (in ms) to training_time_ms.
             model.eval()
-            val_batch_size = world_size * args.val_seq_len
+
+            val_batch_size = world_size * args.val_seq_len # total tokens per validation batch across all GPUs.
             assert args.val_tokens % val_batch_size == 0
-            val_steps = args.val_tokens // val_batch_size
+            val_steps = args.val_tokens // val_batch_size 
+            # how many batches we need to process to cover exactly val_tokens in total
+
             val_loader = distributed_data_generator(args.val_files, val_batch_size, rank, world_size)
             val_loss = 0
             with torch.no_grad():
@@ -1198,9 +1279,12 @@ if __name__ == "__main__":
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
         model(inputs, targets, get_window_size_blocks(step)).backward()
+        # As each grad is ready, your _gradient_hook fires and 
+        # kicks off bucketed all‐reduce communications under the hood.
         #for param in model.parameters():
         #    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         wait_for_gradients() # does the same thing as commented two lines above, but faster
+        
 
         # set optimization hyperparameters
         for opt in optimizers:
@@ -1220,4 +1304,5 @@ if __name__ == "__main__":
 
     print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-    dist.destroy_process_group()
+    # Logs the peak and currently reserved GPU memory (in MiB).
+    dist.destroy_process_group() # cleanly shuts down your NCCL communication context.
