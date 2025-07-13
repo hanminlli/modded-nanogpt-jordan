@@ -572,8 +572,10 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
-                                    use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        # self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
+        #                             use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        # We turn off fp8 support which allows us to run on A100
+        self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128), use_fp8=False)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -895,8 +897,10 @@ if __name__ == "__main__":
         val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
         val_tokens = 10485760 
         # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-        train_seq_len = 48 * 1024 # FlexAttention sequence length
-        val_seq_len = 4 * 64 * 1024 # FlexAttention sequence length for validation
+        # train_seq_len = 48 * 1024 # FlexAttention sequence length
+        # val_seq_len = 4 * 64 * 1024 # FlexAttention sequence length for validation
+        train_seq_len = 24 * 1024 # FlexAttention sequence length
+        val_seq_len = 2 * 64 * 1024 # FlexAttention sequence length for validation
         # optimization
         num_iterations = 1770 # number of iterations to run
         cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
