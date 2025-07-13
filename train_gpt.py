@@ -899,8 +899,8 @@ if __name__ == "__main__":
         # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
         # train_seq_len = 48 * 1024 # FlexAttention sequence length
         # val_seq_len = 4 * 64 * 1024 # FlexAttention sequence length for validation
-        train_seq_len = 24 * 1024 # FlexAttention sequence length
-        val_seq_len = 2 * 64 * 1024 # FlexAttention sequence length for validation
+        train_seq_len = 48 * 1024 # FlexAttention sequence length
+        val_seq_len = 4 * 64 * 1024 # FlexAttention sequence length for validation
         # optimization
         num_iterations = 1770 # number of iterations to run
         cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
